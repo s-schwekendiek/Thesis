@@ -4,12 +4,11 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import operator
 
+import operator
 import sys
 import itertools
 import os
-import socket
 import copy
 import random
 from collections import defaultdict
@@ -17,21 +16,43 @@ from typing import Type
 import argparse
 import pickle
 
-import argparse
 import torch
-from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torch import nn
-import torch.distributed as dist
-from torch.multiprocessing import Process
-
 from torchmetrics.functional import r2_score as r2Functional
 
 random.seed(42)
 
 class SequenceDataset(Dataset):
+    """Create sequences for each datapoint in the dataset."""
+
     def __init__(self, dataframe, targets, features_conc,features_conc_bool, sequence_length,drop_heights=None,features_meteo = [],features_meteo_bool = [],start_buffer : int = 24*6*3,drop_range : tuple = (6*24*1,6*24*7)):
+
+        """Parameters
+        ----------
+        dataframe : dataframe
+            Dataset to be used
+        targets : list
+            target columns
+        features_conc : list
+            concentration data features
+        features_conc_bool : list
+            missing indicator of concenctration data features as boolean mask
+        sequence_length : int
+            length of sequences
+        drop_heights : int
+            number of vertical profile variables to be dropped
+        features_meteo : list
+            meteorological data features
+        features_meteo_bool : list
+            missing indicator of meteorological data features as boolean mask
+        start_buffer : int
+            minimum number of timesteps that should remain available at the beginning of the sequence
+        drop_range : tuple
+            minimum and maximum number of timesteps to be dropped """
+
+
         if start_buffer > sequence_length:
             raise ValueError("buffer longer than sequence")
         elif start_buffer+drop_range[1] > sequence_length:
@@ -57,7 +78,14 @@ class SequenceDataset(Dataset):
         return self.X_c.shape[0]
 
     def __getitem__(self, i):
+
+        """Drop values from vertical concentration data according to drop_heights and drop_range, then return sequence at index i"""
+
+        
         drop_length = random.randint(*self.drop_range)    
+
+        #Check if there are enough previous timestepts to generate a sequence
+        #then set concentration features to -1 and boolean mask to 1
         if i >= self.sequence_length - 1:
             if not isinstance(self.drop_heights, type(None)):
                 self.X_c[i-drop_length+1:i+1,self.drop_heights] = -1
@@ -73,6 +101,8 @@ class SequenceDataset(Dataset):
                 x = torch.cat((x_m,x_c,x_m_b,x_c_b),1)
             else:
                 x = torch.cat((x_c,x_c_b),1)
+
+        #if not enough previous timesteps exist, repeat first element until length is reached 
         else:
             padding_c = self.X_c[0].repeat(self.sequence_length - i - 1, 1)
             padding_c_b = self.X_c_b[0].repeat(self.sequence_length - i - 1, 1)
@@ -101,7 +131,27 @@ class SequenceDataset(Dataset):
 
 class DeepRegressionLSTM(nn.Module):
 
+    """LSTM class extending nn.Module """
+
+
     def __init__(self, input_size, hidden_size,num_layers,seq_length,dropout_val,num_classes = 18):
+
+        """Parameters
+        ----------
+        input_size : int
+            number of featuers
+        hidden_size : int 
+            number of hidden layers
+        num_layers : int 
+            number of stacked LSTM layers
+        seq_length : int 
+            sequence length
+        dropout_val : float
+            dropout value
+        num_classes : int
+            number of targets
+        """
+
         super().__init__()
         self.input_size = input_size  
         self.hidden_size = hidden_size
@@ -130,7 +180,17 @@ class DeepRegressionLSTM(nn.Module):
         return out
     
 class EarlyStopper:
+    """ Function to stop training training early if validation loss doesn't improve
+    """
     def __init__(self, patience=5, min_delta=0.01):
+        """
+        Parameters
+        ----------
+        patience : int
+            number of epochs allowed with no improvement
+        min_delta : float
+            minimum amount of increase to consider an improvement
+        """
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
@@ -151,6 +211,11 @@ class EarlyStopper:
 
 
 def initData(data,features,target_sensors,forecast_lead=1):
+
+    """Creates targets, then normalizes data and creates boolean mask as set of features 
+    """
+
+
     df = data[features].copy()
 
     forecast_lead = 1
@@ -160,6 +225,7 @@ def initData(data,features,target_sensors,forecast_lead=1):
         targets.append(target)
         df[target] = data[target_sensor].shift(-forecast_lead)
     df = df.iloc[:-forecast_lead]
+
     minmaxDict = {}
     if args.min_max:
         for c in df.columns:
@@ -176,11 +242,13 @@ def initData(data,features,target_sensors,forecast_lead=1):
     features_mask = [(f+"_Bool") for f in features]
     features = list(features)+list(features_mask)
 
-
     return {"features" : features, "targets" : targets,"minmaxDict" : minmaxDict,"data" : df}
 
 
 def initSplit(df,targets,features,sequence_length,batch_size,split,validation_start = "2002-03-27 8:50:00",test_start = "2003-03-27 8:50:00"):
+    """Split data into training,validation and test splits. Create dataloaders from splits.
+    """
+
     match split:
         case "2Year":
             df_train = df.loc["2001-03-27 8:50:00":validation_start].copy()
@@ -218,6 +286,7 @@ def initSplit(df,targets,features,sequence_length,batch_size,split,validation_st
     sequence_length = sequence_length
     batch_size = batch_size
     drop_heights = args.drop_heights
+
     random.seed(42)
     if drop_heights:
         drop_list = np.sort(np.random.choice(np.arange(0,len(f_c)),drop_heights,replace=False))
@@ -231,6 +300,7 @@ def initSplit(df,targets,features,sequence_length,batch_size,split,validation_st
         drop_min = 3
     print(f"dropping {drop_heights} heights, list is {drop_list}")
     print(f"dropping {drop_max} days")
+
     train_dataset = SequenceDataset(
         df_train,
         targets=targets,
@@ -275,12 +345,12 @@ def initSplit(df,targets,features,sequence_length,batch_size,split,validation_st
 
 
 def train_model(data_loader, model,seqType, loss_function, optimizer = "adam"):
+
     lossDivisor = 0
     total_loss = 0
     nanCount = 0
     model.train()
     for X, y in data_loader:
-
         X = X
         y = y
         output = model(X)
@@ -345,6 +415,7 @@ def validate_model(data_loader, model, loss_function):
 
 
 def predict(data_loader, model,save=None):
+    #saves to set path. also assumes that model was trained on cuda device. best to leave save at None
     if save:
         modelPath = "../Output/Models/"
         model.load_state_dict(torch.load(modelPath+save+"_best-model.pt",map_location={'cuda:0': 'cpu'}))
@@ -416,29 +487,28 @@ def do_validating(rank,model,data,loss_function = r2Functional):
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--index', type = int,default=52)
-parser.add_argument('dataset', choices=["All", "Conc"])
-parser.add_argument('--split', choices = ["2Year","1Year", "2nd","8020","Identical","Middle"],default="8020")
-parser.add_argument('--seqType', choices=["Lst", "Full"],default="Lst")
+parser.add_argument('--index', type = int,default=52,help="index of hyperparameter set to use")
+parser.add_argument('dataset', choices=["All", "Conc"],help="dataset selection")
+parser.add_argument('--split', choices = ["2Year","1Year", "2nd","8020","Identical","Middle"],default="8020",help="train/validation/test split")
+parser.add_argument('--seqType', choices=["Lst", "Full"],default="Lst",help="parts of sequence to create predictions from")
 parser.add_argument('--early_stopping',type = int,default=5)
 parser.add_argument('--metric',choices = ["mse","mae","r2_score"],default="r2_score")
-parser.add_argument('--drop_heights',type=int,default=18)
-parser.add_argument('--drop_max_days', type=int)
-parser.add_argument('--drop_min_days', type = int)
-parser.add_argument('--drop_meteo',type=int)
-parser.add_argument('--save_name', type=str)
-parser.add_argument('--keep_meteo',type=int)
-parser.add_argument("--min_max",type=bool,default=True)
-parser.add_argument('--do',choices=["train","predict"],default=predict)
+parser.add_argument('--drop_heights',type=int,default=18,help="number of profile variables to drop")
+parser.add_argument('--drop_max_days', type=int,help="maximum gap length in days")
+parser.add_argument('--drop_min_days', type = int,help ="minimum gap length in days")
+parser.add_argument('--drop_meteo',type=int,help ="indice of meteorological feature to drop,may not work with keep_meteo")
+parser.add_argument('--save_name', type=str,help ="fileName for saving outputs and models" )
+parser.add_argument('--keep_meteo',type=int,help="indice of meteorological featuer to keep,may not work with drop_meteo")
+parser.add_argument("--min_max",type=bool,default=True,help="boolean flag for normalizing data")
+parser.add_argument('--do',choices=["train","predict"],default=predict,help="decides if script does training or predicting")
 parser.add_argument('--feature_selection',type=bool,default=False)
-
 args = parser.parse_args()
 
-
+#set of meteorological variables to keep or drop
 selected_meteo = ["TA_44m_degC","VPD_hPa","WD_deg","SW_OUT_Wm-2","LW_IN_Wm-2","LW_OUT_Wm-2","TS_1_50cm_degC","G_1_5cm_Wm-2"]
-
 droppable_meteo = ["TA_44m_degC","PA_hPa","RH_%","VPD_hPa","WD_deg","WS_ms-1","SW_IN_Wm-2","SW_OUT_Wm-2","LW_IN_Wm-2","LW_OUT_Wm-2","NETRAD_Wm-2","P_mm","TS_1_50cm_degC","SWC_1_32cm_%","G_1_5cm_Wm-2"]
 
+#read in files, drop NA values and drop duplicate timestamps
 data_Concentration = pd.read_csv("../Daten/DE-Hai_profile_10min_qaqc_2001_2003.csv",sep="\t",parse_dates=["TIMESTAMP_END"],index_col=0)
 data_Meteo = pd.read_csv("../Daten/DE-Hai_Meteo_all_10min_20010101_20031231.csv",parse_dates = ["TIMESTAMP_END"],index_col = 1)
 data_Meteo.drop(columns = ["TIMESTAMP_START"],inplace = True)
@@ -446,30 +516,35 @@ data_Concentration = data_Concentration[~data_Concentration.index.duplicated(kee
 data_Concentration.dropna(how = "any",inplace=True)
 data_Meteo = data_Meteo[~data_Meteo.index.duplicated(keep = "first")]
 
+#select kept feature if keep_meteo
 if args.keep_meteo:
     data_Meteo = data_Meteo[droppable_meteo[args.keep_meteo]]
     print(f"only using {data_Meteo.name} column from Meteo")
 
+#use only timesteps available in both datasets
 idx = data_Concentration.index.intersection(data_Meteo.index)
 data_Concentration = data_Concentration.loc[idx]
 data_Meteo = data_Meteo.loc[idx]
 data_All = pd.concat([data_Meteo,data_Concentration],axis  =1)
 
+#initialize the data
 allDict = initData(data = data_All,features = data_All.columns,target_sensors = data_Concentration.columns)
 concDict = initData(data = data_All,features = data_Concentration.columns, target_sensors=data_Concentration.columns)
+
 sequence_length = 6*24*10
 batch_size = 16
 parameterSetIndices = (0,1)
 
-
+#chose which dataset and loss function to use, mae is not implemented well (or possibly at all)
 dataSelection = {"All" : allDict, "Conc" : concDict}
 metricSelection = {"mse" : nn.MSELoss(),"mae" : nn.L1Loss(), "r2_score": r2Functional}
 
-
+#drop meteorological variables if drop_meteo
 if args.drop_meteo:
     data_All.drop(columns = droppable_meteo[args.drop_meteo])
     print("dropped", droppable_meteo[args.drop_meteo])
 
+#create set of all combinations of viable hyperparameters, then select via --index option.
 parameters = {"dropout":  [0.2,0.1,0.05],"hidden_layer_size":[32,128,256],"learn_rate":  [0.05,0.005],"num_layers" :  [2,3],"weight_decay" : [0,0.01]}
 def parameterProduct(parameters):
     return(dict(zip(parameters.keys(), x)) for x in itertools.product(*parameters.values()))
@@ -479,15 +554,19 @@ print("using setIndice", args.index, "of", len(parameterSets))
 fileName = "".join([(str(f)+"-") for f in parameterSet.values()])
 print("fileName is " + fileName)
 
+
 def runStuff(dictToInit,split,metric = r2Functional,early_stopping=5):
+
+    """
+    Function to create dataloaders, setup model, do training or predictions
+    """
 
     allDict.update(initSplit(allDict["data"],features = allDict["features"],targets = allDict["targets"],split=split,sequence_length=sequence_length,batch_size=batch_size))
     concDict.update(initSplit(concDict["data"],features = concDict["features"],targets = concDict["targets"],split=split,sequence_length=sequence_length,batch_size=batch_size))
     initDict= dictToInit
  
     model = DeepRegressionLSTM(input_size=len(initDict["features"]), hidden_size=parameterSet["hidden_layer_size"],num_layers=parameterSet["num_layers"],dropout_val=parameterSet["dropout"],seq_length=sequence_length)
-   # model = torch.nn.parallel.DistributedDataParallel(model,device_ids=[device_id])
-   
+  
     toMaxOptimizer = args.metric == "r2_score"
     print(f"to maximize is {toMaxOptimizer}")
     optimizer = torch.optim.Adam(model.parameters(), lr=parameterSet["learn_rate"],weight_decay = parameterSet["weight_decay"],maximize=toMaxOptimizer)
@@ -503,51 +582,8 @@ def runStuff(dictToInit,split,metric = r2Functional,early_stopping=5):
         outputFile+=args.save_name
     with open(outputFile, "wb") as fp:
         pickle.dump(vd,fp)
-    #dist.destroy_process_group()
 
 
 
 if __name__ == "__main__":
-#    world_size = int(os.environ['SLURM_NPROCS'])
-#    world_rank = int(os.environ['SLURM_PROCID'])
-#    ngpus_per_node=torch.cuda.device_count()
-#    hostname = socket.gethostname()
-
-    #torch.cuda.set_device(0)
     runStuff(dataSelection[args.dataset],split = args.split,metric=metricSelection[args.metric],early_stopping=args.early_stopping)
-#    init_processes(world_rank, world_size,ngpus_per_node, hostname, backend='nccl')
-
-# sweep_configuration = {
-#     "method": "bayes",
-#     "metric": {
-#         "goal": "maximize",
-#         "name": "test_avg_loss",
-#     },
-    # "parameters": {
-    #     "dropout": {
-    #         "values" : [0.05, 0.005]
-    #         },
-    #     "hidden_layer_size": {
-    #         "values" : [32,128]
-    #         },
-    #     "learn_rate": {
-    #         "values" : [0.05, 0.005]
-    #         },
-    #     "num_layers" : {
-    #         "values" : [2,3]
-    #         }
-    # }
-
-    
-#def init_processes(Myrank, size,ngpus_per_node, hostname, backend='nccl'):
-#    """ Initialize the distributed environment. """
-#    dist.init_process_group("nccl",rank = Myrank, world_size = size)
-#    
-#    print("Initialized Rank:", dist.get_rank())
-#    hostname = socket.gethostname()
-#    ip_address = socket.gethostbyname(hostname)
-#    print(ip_address)
-
-#    device_id = Myrank % torch.cuda.device_count()
-#    torch.cuda.set_device(Myrank)
-#   print("rank is ",Myrank)
